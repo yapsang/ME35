@@ -1,0 +1,7 @@
+# This code changes the color of the two neo pixels on teh ROBO ESP board
+import neopixel #importing the library
+from machine import Pin # another way of importing a library
+lights = neopixel.NeoPixel(Pin(15), 2) # 0 is the Pin for neopixel and 4 is the number of lights
+lights[0] = (20,0,20)
+lights[1] = (20,0,20) 
+lights.write()

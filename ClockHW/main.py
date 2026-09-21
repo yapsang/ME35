@@ -20,8 +20,12 @@
 #   HIGH tide  : top blue blinks, bottom blue solid
 #   LOW tide   : bottom blue blinks, top blue solid
 #   Red LED    : ON = PM, OFF = AM (for whatever time the servo is showing)
-#   Servo dial : 0 deg = 12:00, 180 deg = just before 12:00 (12-hour semicircle).
-#                Snaps back to 0 at noon and midnight.
+#   Servo dial : matches the printed face - 12 on the LEFT, 6 at the TOP, 12 on the RIGHT.
+#                Pointer sweeps left -> over the top -> right across 12 hours, then glides
+#                back to the left 12 at noon and midnight (red LED tells you AM vs PM).
+#
+# FIRST-TIME SETUP: set CALIBRATE = True, upload, and follow the Shell prompts to
+# line the surfboard pointer up with the printed dial. Then set it back to False.
 #   Booting    : both blue LEDs blink together while connecting / syncing
 #   Error      : red LED flashes fast, then returns to clock mode
 # ---------------------------------------------------------------------------
@@ -38,7 +42,8 @@ SSID = "tufts_eecs"
 PASSWORD = "foundedin1883"
 
 TIMEZONE = "America/New_York"
-TIME_URL = "http://worldtimeapi.org/api/timezone/" + TIMEZONE
+TIME_URL = "https://timeapi.io/api/time/current/zone?timeZone=" + TIMEZONE   # free, no key
+DATE_HEADER_URL = "https://www.google.com/generate_204"   # backup: any server's "Date" header
 NOAA_STATION = "8443970"        # Boston, MA  (find others at tidesandcurrents.noaa.gov)
 
 PIN_SERVO = 4
@@ -47,9 +52,16 @@ PIN_BLUE_TOP = 26
 PIN_BLUE_BOTTOM = 33
 PIN_BUTTON = 32                 # 34 = onboard button
 
-SERVO_MIN_US = 500              # pulse width at 0 deg   - tune for your servo
-SERVO_MAX_US = 2500             # pulse width at 180 deg - tune for your servo
-SERVO_REVERSE = False           # flip if the pointer sweeps the wrong way
+# Dial calibration (see CALIBRATE below).
+#   DIAL_LEFT_US  = pulse that points the pointer at the LEFT 12  (start of the dial)
+#   DIAL_RIGHT_US = pulse that points the pointer at the RIGHT 12 (end of the dial)
+# Servo shaft faces you through the plate, so a standard SG90/MG90 turns
+# counter-clockwise as the pulse gets longer: long pulse = left, short pulse = right.
+# If your pointer runs backwards, just swap these two numbers.
+DIAL_LEFT_US = 2500
+DIAL_RIGHT_US = 500
+SERVO_SPEED_DEG_S = 120         # how fast the pointer glides between positions
+CALIBRATE = False               # True = run the pointer-alignment routine instead of the clock
 
 BLINK_MS = 500
 DEBOUNCE_MS = 250
@@ -75,17 +87,57 @@ else:
 servo = PWM(Pin(PIN_SERVO), freq=50)
 
 
-def set_angle(angle):
-    angle = max(0, min(180, angle))
-    if SERVO_REVERSE:
-        angle = 180 - angle
-    us = SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * angle / 180
+def write_us(us):
     servo.duty_u16(int(us * 65535 / 20000))   # 20 ms period at 50 Hz
 
 
+def dial_to_us(pos):
+    # pos = 0 deg (left 12) ... 90 deg (6, top) ... 180 deg (right 12), as printed on the face
+    pos = max(0, min(180, pos))
+    return DIAL_LEFT_US + (DIAL_RIGHT_US - DIAL_LEFT_US) * pos / 180
+
+
+current_pos = None
+
+
+def set_angle(pos, smooth=True):
+    # Glide to a dial position instead of snapping, so the pointer (and the
+    # glued-on surfboard) doesn't whip across the face at noon/midnight.
+    global current_pos
+    pos = max(0, min(180, pos))
+    if current_pos is None or not smooth:
+        write_us(dial_to_us(pos))
+        current_pos = pos
+        return
+    step = 1 if pos > current_pos else -1
+    delay = int(1000 / SERVO_SPEED_DEG_S)
+    p = current_pos
+    while abs(pos - p) > 1:
+        p += step
+        write_us(dial_to_us(p))
+        time.sleep_ms(delay)
+    write_us(dial_to_us(pos))
+    current_pos = pos
+
+
 def time_to_angle(hour, minute):
-    # 12 hours across 180 degrees = 15 degrees per hour
+    # 12 hours across the 180 deg face = 15 deg per hour, 12 o'clock at the left end
     return ((hour % 12) + minute / 60) * 15
+
+
+def calibrate():
+    """Walk the pointer around the printed dial so you can align it."""
+    print("\n=== DIAL CALIBRATION ===")
+    print("1. Take the pointer off the horn.")
+    print("2. Watch where the shaft goes, then press the pointer on pointing at the LEFT 12.")
+    points = [(0, "LEFT 12"), (45, "3"), (90, "6 (top)"), (135, "9"), (180, "RIGHT 12")]
+    while True:
+        for pos, name in points:
+            set_angle(pos)
+            print("Pointer should be on %-9s (%4d us)" % (name, dial_to_us(pos)))
+            time.sleep(3)
+        print("If the ends are short or overshoot, adjust DIAL_LEFT_US / DIAL_RIGHT_US")
+        print("by ~50 us at a time. If it runs backwards, swap them. Ctrl-C to stop.\n")
 
 
 def booting_leds(on):
@@ -121,12 +173,34 @@ btn.irq(trigger=Pin.IRQ_FALLING, handler=on_press)
 wlan = network.WLAN(network.STA_IF)
 
 
-def connect_wifi(timeout_s=20):
+def reset_wifi():
+    # Full radio reset - clears the "Wifi Internal State Error" condition
+    try:
+        wlan.disconnect()
+    except Exception:
+        pass
+    wlan.active(False)
+    time.sleep_ms(500)
     wlan.active(True)
+    try:
+        wlan.config(pm=wlan.PM_NONE)        # disable power-save (causes random drops)
+    except Exception:
+        pass
+
+
+def connect_wifi(timeout_s=20):
+    if not wlan.active():
+        reset_wifi()
     if wlan.isconnected():
         return True
     print("Connecting to WiFi...")
-    wlan.connect(SSID, PASSWORD)
+    try:
+        wlan.connect(SSID, PASSWORD)
+    except OSError as e:
+        # Happens if a previous attempt is still half-open - reset and retry once
+        print("WiFi state error, resetting radio:", e)
+        reset_wifi()
+        wlan.connect(SSID, PASSWORD)
     start = time.time()
     blink = 0
     while not wlan.isconnected():
@@ -135,9 +209,39 @@ def connect_wifi(timeout_s=20):
         time.sleep_ms(250)
         if time.time() - start > timeout_s:
             print("WiFi timeout")
+            reset_wifi()                    # leave the radio in a clean state
             return False
     print("Connected! IP:", wlan.ifconfig()[0])
     return True
+
+
+def get_json(url, tries=3):
+    """GET a URL and return parsed JSON, retrying on flaky connections."""
+    last_err = None
+    for attempt in range(tries):
+        if not connect_wifi():
+            last_err = OSError("no WiFi")
+            continue
+        gc.collect()
+        r = None
+        status = None
+        try:
+            r = urequests.get(url, headers={"Connection": "close"})
+            status = r.status_code
+            if status != 200:
+                raise OSError("HTTP %d" % status)
+            return r.json()
+        except Exception as e:
+            last_err = e
+            print("GET failed (try %d/%d): %s" % (attempt + 1, tries, e))
+            if status is not None and 400 <= status < 500:
+                break                       # 4xx (e.g. 401): retrying won't help
+            time.sleep(2)
+        finally:
+            if r:
+                r.close()
+            gc.collect()
+    raise last_err
 
 
 # ------------------------------- TIME --------------------------------------
@@ -160,53 +264,79 @@ def set_rtc_local(local_secs):
     machine.RTC().datetime((t[0], t[1], t[2], t[6], t[3], t[4], t[5], 0))
 
 
-def sync_time():
-    """Primary: worldtimeapi.org. Fallback: NTP + US Eastern DST rule."""
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def set_rtc_from_local_fields(y, mo, d, h, mi, s):
+    local_secs = time.mktime((y, mo, d, h, mi, s, 0, 0))
+    set_rtc_local(local_secs)
+
+
+def time_from_timeapi_io():
+    # Response has local-time fields: year, month, day, hour, minute, seconds
+    data = get_json(TIME_URL)
+    set_rtc_from_local_fields(data["year"], data["month"], data["day"],
+                              data["hour"], data["minute"], data["seconds"])
+
+
+def time_from_date_header():
+    # Every HTTPS server sends a "Date: Mon, 21 Sep 2026 14:05:33 GMT" header.
+    # Uses normal web traffic, so it works even when the network blocks NTP.
     if not connect_wifi():
-        return False
+        raise OSError("no WiFi")
     gc.collect()
+    r = urequests.get(DATE_HEADER_URL)
     try:
-        r = urequests.get(TIME_URL)
+        date_str = None
+        for k, v in r.headers.items():
+            if k.lower() == "date":
+                date_str = v
+    finally:
+        r.close()
+        gc.collect()
+    if not date_str:
+        raise ValueError("no Date header")
+    p = date_str.split()                    # ['Mon,', '21', 'Sep', '2026', '14:05:33', 'GMT']
+    hh, mm, ss = [int(x) for x in p[4].split(":")]
+    utc = time.mktime((int(p[3]), MONTHS.index(p[2]) + 1, int(p[1]), hh, mm, ss, 0, 0))
+    set_rtc_local(utc + eastern_offset(utc))
+
+
+def time_from_ntp():
+    if not connect_wifi():
+        raise OSError("no WiFi")
+    import ntptime
+    ntptime.settime()                       # sets RTC to UTC
+    utc = time.time()
+    set_rtc_local(utc + eastern_offset(utc))
+
+
+def sync_time():
+    """Try each time source in order until one works."""
+    sources = (("timeapi.io", time_from_timeapi_io),
+               ("HTTP Date header", time_from_date_header),
+               ("NTP", time_from_ntp))
+    for name, fn in sources:
         try:
-            data = r.json()
-        finally:
-            r.close()
-        utc = data["unixtime"] - EPOCH_OFFSET
-        offset = data["raw_offset"] + data["dst_offset"]
-        set_rtc_local(utc + offset)
-        print("Time synced (worldtimeapi):", time.localtime())
-        return True
-    except Exception as e:
-        print("worldtimeapi failed:", e, "- trying NTP")
-    try:
-        import ntptime
-        ntptime.settime()                   # sets RTC to UTC
-        utc = time.time()
-        set_rtc_local(utc + eastern_offset(utc))
-        print("Time synced (NTP):", time.localtime())
-        return True
-    except Exception as e:
-        print("NTP failed:", e)
-        return False
+            fn()
+            print("Time synced (%s):" % name, time.localtime())
+            return True
+        except Exception as e:
+            print("%s failed: %s" % (name, e))
+    return False
 
 
 # ------------------------------- TIDES -------------------------------------
 def fetch_tides():
     """Returns {'H': (hour, minute), 'L': (hour, minute)} for the next high/low tide."""
-    if not connect_wifi():
-        raise OSError("no WiFi")
     y, m, d = time.localtime()[:3]
     url = ("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
            "?product=predictions&application=robo_tide_clock"
            "&begin_date=%04d%02d%02d&range=48&datum=MLLW"
            "&station=%s&time_zone=lst_ldt&units=english"
            "&interval=hilo&format=json") % (y, m, d, NOAA_STATION)
-    gc.collect()
-    r = urequests.get(url)
-    try:
-        data = r.json()
-    finally:
-        r.close()
+    data = get_json(url)
 
     now = time.time()
     nxt = {"H": None, "L": None}
@@ -225,7 +355,9 @@ def fetch_tides():
 
 
 # ------------------------------- STARTUP -----------------------------------
-set_angle(0)
+set_angle(0, smooth=False)      # park on the left 12 while booting
+if CALIBRATE:
+    calibrate()
 while not sync_time():
     flash_error(4)
     time.sleep(5)
@@ -296,4 +428,3 @@ while True:
         last_sync = time.ticks_ms()
 
     time.sleep_ms(20)
-    
